@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import logging
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+
+DESC = """
+A deployment tool for syncing a directory to S3 and generating a CloudFront invalidation based on the sync result.
+""".strip()
+
+ACTION_LINE = re.compile(r'^(?P<action>upload|delete)', re.I)
+
+UPDATE_LINE = re.compile(
+    r'^(?P<action>upload)\:\s+(?P<local_path>.+)\s+to\s+(?:s3\://(?P<bucket>[^/]+)(?P<remote_path>/.+))\s*$',
+    re.I
+)
+DELETE_LINE = re.compile(r'^(?P<action>delete)\:\s+(?:s3\://(?P<bucket>[^/]+)(?P<remote_path>/.+))\s*$', re.I)
+
+
+class SyncException(Exception):
+    pass
+
+
+class SyncResult(object):
+
+    def __init__(self, remote_path, action):
+        self.remote_path = remote_path
+        self.action = action
+
+
+class InvalidationResult(object):
+
+    def __init__(self, id, changed_files):
+        self.id = id
+        self.changed_files = changed_files
+
+
+class S3CFDeploy(object):
+
+    def __init__(self, logger, path, bucket, remote_path, cloudfront_dist_id, sync_opts):
+        self.logger = logger
+        self.path = path
+        self.bucket = bucket
+        self.remote_path = remote_path
+        self.cloudfront_dist_id = cloudfront_dist_id
+        self.sync_opts = sync_opts
+
+    def sync(self):
+        """Runs the S3 sync and returns a list of filenames to invalidate."""
+        # normalize things
+        local_path = "{path}{slash}".format(path=self.path, slash="/" if not self.path.endswith("/") else "")
+        remote_path = "s3://{bucket}{remote_path}".format(bucket=self.bucket, remote_path=self.remote_path)
+        opts = self.sync_opts or []
+
+        # aws s3 sync $OPTS $local $remote
+        cmd_args = [i for i in filter(lambda e: len(e) > 0, ["aws", "s3", "sync"] + opts + [local_path, remote_path])]
+
+        self.logger.info("Running S3 synchronization command: %s", " ".join(cmd_args))
+
+        p = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = map(lambda s: s.decode('utf-8'), p.communicate())
+
+
+        # determine if failure
+        if not p.returncode == 0:
+            self.logger.error("Command '%s' returned %02d", " ".join(cmd_args), p.returncode)
+            raise SyncException("The S3 command failed to synchronize the files.")
+
+        # parse lines of output into results
+        results = []
+
+        self.logger.info("Synchronization Complete.")
+
+        for line in [l for l in re.compile(r'[\r\n]+').split(stdout) if ACTION_LINE.search(l)]:
+            self.logger.debug("Sync Output Line: %s", line)
+
+            matches = [m.match(line) for m in (UPDATE_LINE, DELETE_LINE) if m.search(line)][0:]
+            for m in matches:
+                results.append(SyncResult(action=m.group('action'), remote_path=m.group('remote_path').strip()))
+                self.logger.debug("Created SyncResult - %s: %s", results[-1].action, results[-1].remote_path)
+
+        return results
+
+    def invalidate(self, changed_files):
+        """Generate an invalidation for the given set of changed files."""
+        if not self.is_cloudfront_enabled():
+            self.logger.debug("CloudFront support is not enabled, turning it on now.")
+            self.enable_cloudfront()
+        else:
+            self.logger.debug("CloudFront support is already enabled.")
+
+        cmd_args = ["aws", "cloudfront", "create-invalidation", "--distribution-id", self.cloudfront_dist_id,
+            "--paths"] + list(map(lambda c: c.remote_path, changed_files))
+
+        self.logger.info("Running CloudFront invalidation command: %s", " ".join(cmd_args))
+
+        p = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = map(lambda s: s.decode('utf-8'), p.communicate())
+
+        # determine if failure
+        if not p.returncode == 0:
+            self.logger.error("Command '%s' returned %02d", " ".join(cmd_args), p.returncode)
+            raise SyncException("Unable to generate a CloudFront invalidation.")
+
+        # parse output into JSON
+        j = json.loads(stdout)
+
+        result = InvalidationResult(
+            id=j['Invalidation']['Id'],
+            changed_files=j['Invalidation']['InvalidationBatch']['Paths']['Items']
+        )
+
+        self.logger.info("CloudFront Invalidation %s Created.", result.id)
+
+        return result
+
+    def is_cloudfront_enabled(self):
+        """
+        Determine if CloudFront Preview Support is Enabled in the AWS CLI.
+
+        There is a really strange edge case that happens if ~/.aws does not exist. The call returns 1 and returns no
+        output. Therefore, it is necessary to make sure that case is handled properly.
+        """
+        cmd_args = ["aws", "configure", "get", "preview.cloudfront"]
+
+        self.logger.debug("Determining if CloudFront support is enabled, running: %s",
+            " ".join(cmd_args))
+
+        p = subprocess.Popen(cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        stdout, stderr = map(lambda v: v.decode('utf-8').strip().lower() if v else "", p.communicate())
+
+        if p.returncode not in (0, 1):
+            self.logger.error("Failed to get CloudFront support status, return code %d, output: %s",
+                p.returncode, stdout)
+            raise SyncException("Unable to determine if CloudFront support is present.")
+
+        self.logger.debug("CloudFront Check Output: %s", stdout)
+
+        return re.compile(r'\n').split(stdout)[0] == "true"
+
+    def enable_cloudfront(self):
+        """Enable CloudFront Preview Support in the AWS CLI."""
+        try:
+            self.logger.info("Enabling CloudFrount CLI support.")
+            subprocess.check_call(["aws", "configure", "set", "preview.cloudfront", "true"])
+        except subprocess.CalledProcessError as e:
+            raise SyncException("Unable to enable CloudFront support in the AWS CLI.")
+
+    def deploy(self):
+        """Sync to S3, then generate a CloudFront invalidation."""
+        sync_results = self.sync()
+        # only create an invalidation if something actually changed
+        invalidation = self.invalidate(sync_results) if len(sync_results) > 0 else None
+
+        return sync_results, invalidation
+
+
+def main():
+    parser = argparse.ArgumentParser(description=DESC)
+    # optional
+    parser.add_argument('-d', '--debug', action='store_true', default=False, help="Debug logging.")
+    parser.add_argument('-v', '--verbose', action='store_true', default=False, help="Verbose logging.")
+    parser.add_argument("-c", "--cloudfront-distro", help="CloudFront distribution ID to create invalidations for.",
+        required=True)
+
+    # positional
+    parser.add_argument("path", help="Local directory to sync with the bucket.")
+    parser.add_argument("bucket", help="Remote S3 bucket to sync with.")
+    parser.add_argument("remote_path", help="Remote S3 path to sync with.", nargs='?', default="/")
+    args = parser.parse_args()
+
+    s3_opts = os.environ.get("S3_OPTS", "")
+
+    # create and setup logging
+    logger = get_logger(args.verbose, args.debug)
+
+    # create worker
+    deployer = S3CFDeploy(logger=logger, path=args.path, bucket=args.bucket, remote_path=args.remote_path,
+        cloudfront_dist_id=args.cloudfront_distro, sync_opts=shlex.split(s3_opts))
+
+    try:
+        sync_results, invalidation = deployer.deploy()
+
+        if invalidation:
+            print("Created Invalidation {} for Changed Paths:".format(invalidation.id))
+
+            for s in sync_results:
+                print("  [{action}] {path}".format(action=s.action.upper(), path=s.remote_path))
+        else:
+            print("No changes detected, nothing to deploy.")
+
+    except SyncException as e:
+        sys.stderr.write("ERROR: {}\n".format(e))
+        sys.stderr.flush()
+        sys.exit(1)
+
+
+def get_logger(verbose, debug):
+    """Creates a logger configured for the deployment."""
+    if debug:
+        level = logging.DEBUG
+    elif verbose:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
+    # hahahahaha
+    class UtcFormatter(logging.Formatter):
+        converter = time.gmtime
+
+    formatter = UtcFormatter("%(message)s" if not verbose else "%(asctime)s [%(levelname)-5s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S%z")
+
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(formatter)
+
+    logger = logging.Logger('s3cfdeploy')
+    logger.setLevel(level)
+    logger.addHandler(handler)
+
+    return logger
+
+
+if __name__ == "__main__":
+    main()
