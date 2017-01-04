@@ -50,13 +50,14 @@ class InvalidationResult(object):
 
 class S3CFDeploy(object):
 
-    def __init__(self, logger, path, bucket, remote_path, cloudfront_dist_id, sync_opts):
+    def __init__(self, logger, path, bucket, remote_path, cloudfront_dist_id, sync_opts, invalidate_all):
         self.logger = logger
         self.path = path
         self.bucket = bucket
         self.remote_path = remote_path
         self.cloudfront_dist_id = cloudfront_dist_id
         self.sync_opts = sync_opts
+        self.invalidate_all = invalidate_all
 
     def sync(self):
         """Runs the S3 sync and returns a list of filenames to invalidate."""
@@ -102,8 +103,14 @@ class S3CFDeploy(object):
         else:
             self.logger.debug("CloudFront support is already enabled.")
 
-        cmd_args = ["aws", "cloudfront", "create-invalidation", "--distribution-id", self.cloudfront_dist_id,
-            "--paths"] + list(map(lambda c: c.remote_path, changed_files))
+        if self.invalidate_all:
+            # if we're doing global invalidations, just invalidate '*'
+            cmd_args = ["aws", "cloudfront", "create-invalidation", "--distribution-id", self.cloudfront_dist_id,
+                "--paths", "/*"]
+        else:
+            # if we're not doing a global invalidation, invalidate only the changed paths
+            cmd_args = ["aws", "cloudfront", "create-invalidation", "--distribution-id", self.cloudfront_dist_id,
+                "--paths"] + list(map(lambda c: c.remote_path, changed_files))
 
         self.logger.info("Running CloudFront invalidation command: %s", " ".join(cmd_args))
 
@@ -174,6 +181,8 @@ def main():
     parser.add_argument('-d', '--debug', action='store_true', default=False,
         help="Debug logging. This implies --verbose.")
     parser.add_argument('-v', '--verbose', action='store_true', default=False, help="Verbose logging.")
+    parser.add_argument("-a", "--invalidate-all", action="store_true", default=False,
+        help="Submit an invalidation for all paths (*) as opposed to individual paths.")
     parser.add_argument("-c", "--cloudfront-distro", help="CloudFront distribution ID to create invalidations for.",
         required=True)
 
@@ -190,7 +199,7 @@ def main():
 
     # create worker
     deployer = S3CFDeploy(logger=logger, path=args.path, bucket=args.bucket, remote_path=args.remote_path,
-        cloudfront_dist_id=args.cloudfront_distro, sync_opts=shlex.split(s3_opts))
+        cloudfront_dist_id=args.cloudfront_distro, sync_opts=shlex.split(s3_opts), invalidate_all=args.invalidate_all)
 
     try:
         sync_results, invalidation = deployer.deploy()
