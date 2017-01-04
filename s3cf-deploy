@@ -16,6 +16,11 @@ DESC = """
 A deployment tool for syncing a directory to S3 and generating a CloudFront invalidation based on the sync result.
 """.strip()
 
+EPILOG = """
+Custom options may be passed to `aws s3 sync` via the S3_OPTS environment variable. Set its contents to the flags of
+your choosing and they will be included in the execution.
+""".strip()
+
 ACTION_LINE = re.compile(r'^(?P<action>upload|delete)', re.I)
 
 UPDATE_LINE = re.compile(
@@ -164,9 +169,10 @@ class S3CFDeploy(object):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=DESC)
+    parser = argparse.ArgumentParser(description=DESC, epilog=EPILOG)
     # optional
-    parser.add_argument('-d', '--debug', action='store_true', default=False, help="Debug logging.")
+    parser.add_argument('-d', '--debug', action='store_true', default=False,
+        help="Debug logging. This implies --verbose.")
     parser.add_argument('-v', '--verbose', action='store_true', default=False, help="Verbose logging.")
     parser.add_argument("-c", "--cloudfront-distro", help="CloudFront distribution ID to create invalidations for.",
         required=True)
@@ -174,7 +180,7 @@ def main():
     # positional
     parser.add_argument("path", help="Local directory to sync with the bucket.")
     parser.add_argument("bucket", help="Remote S3 bucket to sync with.")
-    parser.add_argument("remote_path", help="Remote S3 path to sync with.", nargs='?', default="/")
+    parser.add_argument("remote_path", help="Remote S3 path to sync with. Defaults to /.", nargs='?', default="/")
     args = parser.parse_args()
 
     s3_opts = os.environ.get("S3_OPTS", "")
